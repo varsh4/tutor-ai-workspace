@@ -473,7 +473,7 @@ def call_tutor(student_message):
             "The interface is ready; the key is required to generate tutor responses."
         )
 
-    model_name = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+    model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
     contents = []
 
