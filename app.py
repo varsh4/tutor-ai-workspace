@@ -3,6 +3,8 @@ import io
 import json
 import base64
 import tempfile
+import re
+import math
 from datetime import datetime
 
 import streamlit as st
@@ -24,9 +26,34 @@ except Exception:
     load_workbook = None
 
 try:
+    from pptx import Presentation
+except Exception:
+    Presentation = None
+
+try:
     import pandas as pd
 except Exception:
     pd = None
+
+try:
+    import numpy as np
+except Exception:
+    np = None
+
+try:
+    import matplotlib.pyplot as plt
+except Exception:
+    plt = None
+
+try:
+    import sympy as sp
+except Exception:
+    sp = None
+
+try:
+    from scipy import stats as scipy_stats
+except Exception:
+    scipy_stats = None
 
 try:
     from google import genai
@@ -349,6 +376,10 @@ defaults = {
     "show_reasoning": True,
     "concise_mode": False,
     "generated_visuals": [],
+    "last_verified_result": None,
+    "last_verified_plot": None,
+    "last_verified_academic": None,
+    "last_interaction_id": None,
 }
 
 for key, value in defaults.items():
@@ -360,8 +391,15 @@ for key, value in defaults.items():
 # HELPERS
 # ============================================================
 
+def get_config_value(name, default=""):
+    try:
+        return st.secrets.get(name, os.getenv(name, default))
+    except Exception:
+        return os.getenv(name, default)
+
+
 def get_client():
-    api_key = st.secrets.get("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
+    api_key = get_config_value("GEMINI_API_KEY", "")
     if not api_key:
         return None
     if genai is None:
@@ -375,8 +413,9 @@ def extract_file_content(uploaded_file):
     ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
     raw = uploaded_file.getvalue()
 
-    if ext == "txt" or ext == "md":
-        return raw.decode("utf-8", errors="replace")[:120000]
+    if ext == "txt" or ext == "md" or ext == "json" or ext == "xml":
+        decoded = raw.decode("utf-8", errors="replace")
+        return f"File: {name}\n\n{decoded[:160000]}"
 
     if ext == "csv":
         if pd is None:
@@ -432,6 +471,23 @@ def extract_file_content(uploaded_file):
         except Exception as e:
             return f"DOCX could not be parsed: {e}"
 
+    if ext == "pptx":
+        if Presentation is None:
+            return "PowerPoint uploaded, but python-pptx is unavailable."
+        try:
+            prs = Presentation(io.BytesIO(raw))
+            parts = [f"PowerPoint file: {name}", f"Slides: {len(prs.slides)}"]
+            for i, slide in enumerate(prs.slides, start=1):
+                texts = []
+                for shape in slide.shapes:
+                    if hasattr(shape, "text") and shape.text.strip():
+                        texts.append(shape.text.strip())
+                if texts:
+                    parts.append(f"\n--- Slide {i} ---\n" + "\n".join(texts))
+            return "\n".join(parts)[:160000]
+        except Exception as e:
+            return f"PowerPoint could not be parsed: {e}"
+
     # Images and unsupported binary files are sent as bytes to Gemini when possible.
     return None
 
@@ -445,10 +501,427 @@ def mime_type_for(name):
         "webp": "image/webp",
         "gif": "image/gif",
         "pdf": "application/pdf",
-        "txt": "text/plain",
+        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xls": "application/vnd.ms-excel",
         "csv": "text/csv",
+        "txt": "text/plain",
+        "md": "text/markdown",
+        "json": "application/json",
+        "xml": "application/xml",
+        "pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
     }
     return mapping.get(ext, "application/octet-stream")
+
+
+
+def extract_numeric_pairs(text):
+    """Extract likely (x, y) observations from common table formats."""
+    pairs = []
+    seen = set()
+
+    # Coordinate pairs such as (1, 52), (2,55), [1, 52]
+    for m in re.finditer(r"[\(\[]\s*(-?\d+(?:\.\d+)?)\s*[,;|]\s*(-?\d+(?:\.\d+)?)\s*[\)\]]", text):
+        x, y = float(m.group(1)), float(m.group(2))
+        key = (x, y)
+        if key not in seen:
+            pairs.append(key)
+            seen.add(key)
+
+    # Table rows such as: | 1 | 52 | or 1 | 52
+    for line in text.splitlines():
+        nums = re.findall(r"-?\d+(?:\.\d+)?", line)
+        if len(nums) >= 2 and ("|" in line or "\t" in line):
+            try:
+                x, y = float(nums[0]), float(nums[1])
+                key = (x, y)
+                if key not in seen:
+                    pairs.append(key)
+                    seen.add(key)
+            except Exception:
+                pass
+
+    # Plain CSV-style rows, but only when the entire line is numeric data.
+    # This prevents phrases such as "r, R2, ... 6.5" from being misread as a data pair.
+    for line in text.splitlines():
+        stripped = line.strip()
+        if re.fullmatch(r"-?\d+(?:\.\d+)?\s*,\s*-?\d+(?:\.\d+)?", stripped):
+            nums = re.findall(r"-?\d+(?:\.\d+)?", stripped)
+            x, y = float(nums[0]), float(nums[1])
+            key = (x, y)
+            if key not in seen:
+                pairs.append(key)
+                seen.add(key)
+
+    return pairs
+
+
+def verified_regression(student_message):
+    """Deterministic regression engine used before/without Gemini.
+
+    This is intentionally formula-based so statistics answers do not depend on
+    an LLM guessing arithmetic. Returns a result dictionary or None.
+    """
+    if np is None:
+        return None
+
+    lower = student_message.lower()
+    regression_terms = (
+        "regression", "least squares", "linear model", "line of best fit",
+        "slope", "intercept", "correlation coefficient", "r-squared", "r²", "scatter plot"
+    )
+    if not any(term in lower for term in regression_terms):
+        return None
+
+    pairs = extract_numeric_pairs(student_message)
+    if len(pairs) < 3:
+        return None
+
+    x = np.array([p[0] for p in pairs], dtype=float)
+    y = np.array([p[1] for p in pairs], dtype=float)
+    if len(np.unique(x)) < 2:
+        return None
+
+    slope, intercept = np.polyfit(x, y, 1)
+    y_hat = intercept + slope * x
+    residuals = y - y_hat
+    ss_res = float(np.sum(residuals ** 2))
+    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
+    r_squared = 1.0 - ss_res / ss_tot if ss_tot else float("nan")
+    r = float(np.corrcoef(x, y)[0, 1]) if len(x) >= 2 else float("nan")
+
+    # Detect a prediction request such as "predict for 6.5 hours".
+    prediction = None
+    pred_patterns = [
+        r"(?:predict|prediction|estimate|score)\D{0,50}(?:for|at|when)\s*(?:x\s*=\s*)?(-?\d+(?:\.\d+)?)",
+        r"(?:x\s*=\s*)(-?\d+(?:\.\d+)?)",
+    ]
+    for pattern in pred_patterns:
+        m = re.search(pattern, lower)
+        if m:
+            try:
+                px = float(m.group(1))
+                prediction = (px, float(intercept + slope * px))
+                break
+            except Exception:
+                pass
+
+    # Friendly axis labels for common phrasing; otherwise keep generic X/Y.
+    x_label, y_label = "X", "Y"
+    if "hours studied" in lower and "exam score" in lower:
+        x_label, y_label = "Hours Studied", "Exam Score"
+
+    return {
+        "pairs": pairs,
+        "n": len(pairs),
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "r": r,
+        "r_squared": float(r_squared),
+        "prediction": prediction,
+        "x_label": x_label,
+        "y_label": y_label,
+    }
+
+
+def regression_answer_text(result):
+    """Create a fallback tutor answer using only deterministic verified values."""
+    slope = result["slope"]
+    intercept = result["intercept"]
+    r = result["r"]
+    r2 = result["r_squared"]
+    lines = [
+        "### Verified regression results",
+        f"Using {result['n']} observations, the least-squares regression equation is:",
+        f"**ŷ = {intercept:.3f} + {slope:.3f}x**",
+        "",
+        f"- **Slope:** {slope:.3f}. For each 1-unit increase in x, the predicted y increases by about {slope:.3f} units.",
+        f"- **Y-intercept:** {intercept:.3f}. When x = 0, the model predicts y ≈ {intercept:.3f}.",
+        f"- **Correlation coefficient:** r = {r:.4f}",
+        f"- **R²:** {r2:.4f} ({r2 * 100:.2f}%)",
+    ]
+    if result.get("prediction"):
+        px, py = result["prediction"]
+        lines.append(f"- **Prediction at x = {px:g}:** ŷ = {py:.3f}")
+    lines += ["", "These values were calculated with the app's deterministic statistics engine, not guessed by the language model."]
+    return "\n".join(lines)
+
+
+def make_regression_plot(result):
+    """Create an accurate scatter plot + least-squares regression line."""
+    if plt is None or np is None:
+        return None
+    pairs = result["pairs"]
+    x = np.array([p[0] for p in pairs], dtype=float)
+    y = np.array([p[1] for p in pairs], dtype=float)
+    order = np.argsort(x)
+    xs = x[order]
+    line_y = result["intercept"] + result["slope"] * xs
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.2), dpi=150)
+    ax.scatter(x, y, s=65, label="Observed data", zorder=3)
+    ax.plot(xs, line_y, linewidth=2.5, label="Least-squares regression line")
+    ax.set_title("Scatter Plot with Least-Squares Regression Line")
+    ax.set_xlabel(result.get("x_label", "X"))
+    ax.set_ylabel(result.get("y_label", "Y"))
+    ax.grid(True, alpha=0.22)
+    ax.legend()
+    ax.text(
+        0.02, 0.97,
+        f"ŷ = {result['intercept']:.3f} + {result['slope']:.3f}x\n"
+        f"r = {result['r']:.4f}   R² = {result['r_squared']:.4f}",
+        transform=ax.transAxes, va="top",
+        bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.9, edgecolor="#dddddd")
+    )
+    fig.tight_layout()
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def _extract_number_list(text):
+    """Extract a numeric list from a clearly list-like phrase."""
+    candidates = []
+    # Prefer bracketed lists.
+    for m in re.finditer(r"\[([^\]]+)\]|\(([^\)]+)\)", text):
+        body = m.group(1) or m.group(2)
+        nums = re.findall(r"-?\d+(?:\.\d+)?", body)
+        if len(nums) >= 2:
+            candidates.append([float(n) for n in nums])
+    # Lines beginning with a label followed by numbers.
+    for line in text.splitlines():
+        if re.search(r"(?:data|sample|values?|scores?|ages?|x\s*values?|y\s*values?|group\s*[ab12])\s*[:=]", line, re.I):
+            nums = re.findall(r"-?\d+(?:\.\d+)?", line)
+            if len(nums) >= 2:
+                candidates.append([float(n) for n in nums])
+    if not candidates:
+        return None
+    return max(candidates, key=len)
+
+
+def _extract_two_groups(text):
+    """Extract Group A/B numeric lists when the user supplies them explicitly."""
+    groups = {}
+    for label, body in re.findall(
+        r"(?:group\s*([ab12])|([ab12]))\s*[:=]\s*([^\n]+)", text, re.I
+    ):
+        key = (label or body or "").lower()
+        nums = re.findall(r"-?\d+(?:\.\d+)?", body if isinstance(body, str) else "")
+        if len(nums) >= 2:
+            groups[key] = [float(n) for n in nums]
+    # Simpler explicit forms: Group A: ... / Group B: ...
+    for m in re.finditer(r"group\s*([ab])\s*[:=]\s*([^\n]+)", text, re.I):
+        nums = re.findall(r"-?\d+(?:\.\d+)?", m.group(2))
+        if len(nums) >= 2:
+            groups[m.group(1).lower()] = [float(n) for n in nums]
+    return groups
+
+
+def _format_num(v, digits=6):
+    if isinstance(v, (int, np.integer)):
+        return str(v)
+    if not np.isfinite(float(v)):
+        return str(v)
+    return f"{float(v):.{digits}f}".rstrip("0").rstrip(".")
+
+
+def local_academic_verification(student_message):
+    """Run deterministic academic checks before asking the LLM to explain.
+
+    This is deliberately conservative: it only reports a result when the
+    question contains enough explicit information for a reproducible calculation.
+    Complex/ambiguous problems continue to Gemini with code execution.
+    """
+    if np is None:
+        return []
+    text = student_message.strip()
+    lower = text.lower()
+    results = []
+
+    # 1) Regression/correlation from explicit coordinate pairs or table rows.
+    reg = verified_regression(text)
+    if reg:
+        results.append({"type": "regression", "data": reg, "text": regression_answer_text(reg)})
+
+    # 2) Descriptive statistics from an explicit list.
+    data = _extract_number_list(text)
+    stat_words = ("mean", "median", "mode", "standard deviation", "variance", "range", "quartile", "percentile", "descriptive statistics")
+    if data and any(w in lower for w in stat_words):
+        arr = np.array(data, dtype=float)
+        unique, counts = np.unique(arr, return_counts=True)
+        modes = unique[counts == counts.max()] if counts.max() > 1 else np.array([])
+        q1, med, q3 = np.percentile(arr, [25, 50, 75])
+        desc = (
+            "### Verified descriptive statistics\n"
+            f"- **n:** {len(arr)}\n"
+            f"- **Mean:** {_format_num(np.mean(arr))}\n"
+            f"- **Median:** {_format_num(np.median(arr))}\n"
+            f"- **Standard deviation (sample):** {_format_num(np.std(arr, ddof=1))}\n"
+            f"- **Variance (sample):** {_format_num(np.var(arr, ddof=1))}\n"
+            f"- **Range:** {_format_num(np.min(arr))} to {_format_num(np.max(arr))} (spread {_format_num(np.ptp(arr))})\n"
+            f"- **Q1:** {_format_num(q1)}\n"
+            f"- **Q3:** {_format_num(q3)}\n"
+        )
+        if modes.size:
+            desc += "- **Mode(s):** " + ", ".join(_format_num(x) for x in modes) + "\n"
+        else:
+            desc += "- **Mode:** no repeated value\n"
+        results.append({"type": "descriptive", "data": data, "text": desc})
+
+    # 3) Correlation when x/y pairs are explicitly present.
+    if data and any(w in lower for w in ("correlation", "pearson", "coefficient r")) and not reg:
+        pairs = extract_numeric_pairs(text)
+        if len(pairs) >= 3:
+            x = np.array([p[0] for p in pairs], dtype=float)
+            y = np.array([p[1] for p in pairs], dtype=float)
+            if len(np.unique(x)) > 1 and len(np.unique(y)) > 1:
+                r = float(np.corrcoef(x, y)[0, 1])
+                results.append({
+                    "type": "correlation",
+                    "data": {"pairs": pairs, "r": r},
+                    "text": f"### Verified Pearson correlation\n**r = {_format_num(r, 8)}**\n\nThe sign gives the direction and |r| gives the strength of the linear relationship."
+                })
+
+    # 4) One-sample / two-sample t tests when explicit samples are provided.
+    if scipy_stats is not None and ("t-test" in lower or "t test" in lower):
+        if data and len(data) >= 2:
+            # If a hypothesized mean is stated, use it; otherwise do not invent one.
+            mu_match = re.search(r"(?:population\s+mean|hypothesized\s+mean|test\s+mean|\bmu\b|μ)\s*(?:=|of|is)?\s*(-?\d+(?:\.\d+)?)", lower)
+            if mu_match:
+                mu = float(mu_match.group(1))
+                t_stat, p_val = scipy_stats.ttest_1samp(np.array(data, dtype=float), popmean=mu)
+                df = len(data) - 1
+                results.append({
+                    "type": "one_sample_t",
+                    "data": {"t": float(t_stat), "p": float(p_val), "df": df, "mu": mu},
+                    "text": (
+                        "### Verified one-sample t-test\n"
+                        f"- **t statistic:** {_format_num(t_stat, 6)}\n"
+                        f"- **df:** {df}\n"
+                        f"- **Two-sided p-value:** {_format_num(p_val, 8)}\n"
+                        f"- **Test mean:** {mu}\n"
+                    )
+                })
+
+    # 5) Z-score when a value, mean, and standard deviation are explicit.
+    if any(w in lower for w in ("z score", "z-score", "standard score")):
+        m_x = re.search(r"(?:x|value|score)\s*=\s*(-?\d+(?:\.\d+)?)", lower)
+        m_mu = re.search(r"(?:mean|μ|mu)\s*=\s*(-?\d+(?:\.\d+)?)", lower)
+        m_sd = re.search(r"(?:sd|standard deviation|σ|sigma)\s*=\s*(-?\d+(?:\.\d+)?)", lower)
+        if m_x and m_mu and m_sd and float(m_sd.group(1)) != 0:
+            x, mu, sd = map(lambda m: float(m.group(1)), (m_x, m_mu, m_sd))
+            z = (x - mu) / sd
+            results.append({
+                "type": "z_score",
+                "data": {"x": x, "mu": mu, "sd": sd, "z": z},
+                "text": f"### Verified z-score\n**z = {_format_num(z, 8)}**"
+            })
+
+    # 6) Basic probability/combinatorics with explicit n, r/k and words.
+    if any(w in lower for w in ("combination", "combinations", "choose", "ncr", "permutation", "permutations", "npr")) or re.search(r"\b\d+\s*[cCpP]\s*\d+\b", text):
+        op_match = re.search(r"\b(\d+)\s*([cCpP])\s*(\d+)\b", text)
+        if op_match:
+            n, op, k = int(op_match.group(1)), op_match.group(2).lower(), int(op_match.group(3))
+        else:
+            nums = [float(n) for n in re.findall(r"-?\d+(?:\.\d+)?", text)]
+            ints = [int(n) for n in nums if float(n).is_integer() and int(n) >= 0]
+            n, k = (ints[0], ints[1]) if len(ints) >= 2 else (None, None)
+            op = "p" if any(w in lower for w in ("permutation", "permutations", "npr")) else "c"
+        if n is not None and k is not None and 0 <= k <= n:
+            if op == "p":
+                val = math.factorial(n) // math.factorial(n-k)
+                label = f"{n}P{k}"
+            else:
+                val = math.comb(n, k)
+                label = f"{n}C{k}"
+            results.append({"type": "combinatorics", "data": {"n": n, "k": k, "value": val}, "text": f"### Verified combinatorics\n**{label} = {val:,}**"})
+
+    # 7) Solve a simple algebraic equation containing x.
+    if sp is not None and any(ch in lower for ch in ("solve", "equation", "find x", "find the value of x")) and "=" in text:
+        eq_match = re.search(r"(?:solve|equation|find\s+(?:the\s+)?value\s+of\s+x)?\s*[:\-]?\s*([^\n;?]+=[^\n;?]+)", text, re.I)
+        if eq_match and "x" in eq_match.group(1).lower():
+            raw_eq = eq_match.group(1).strip().rstrip(".")
+            raw_eq = re.sub(r"^(?:solve|equation|find\s+(?:the\s+)?x)\s*[:\-]?\s*", "", raw_eq, flags=re.I)
+            try:
+                lhs, rhs = raw_eq.split("=", 1)
+                x = sp.symbols("x")
+                lhs_expr = sp.sympify(lhs.replace("^", "**"), locals={"x": x})
+                rhs_expr = sp.sympify(rhs.replace("^", "**"), locals={"x": x})
+                solutions = sp.solve(sp.Eq(lhs_expr, rhs_expr), x)
+                if solutions:
+                    sol_text = ", ".join(sp.sstr(v) for v in solutions)
+                    results.append({
+                        "type": "equation",
+                        "data": {"equation": raw_eq, "solutions": [sp.sstr(v) for v in solutions]},
+                        "text": f"### Verified equation solution\n\nSolve **{raw_eq}**\n\n**x = {sol_text}**"
+                    })
+            except Exception:
+                pass
+
+    # 8) Percentage reverse-price problems.
+    sale_match = re.search(r"(?:sale\s+price|selling\s+price)\s*(?:is|of|=)\s*\$?\s*(\d+(?:\.\d+)?)", lower)
+    disc_match = re.search(r"(\d+(?:\.\d+)?)\s*%\s*(?:discount|reduction|off|reduced)|(?:reduced|discounted|discount)\s+by\s+(\d+(?:\.\d+)?)\s*%", lower)
+    if sale_match and disc_match:
+        sale = float(sale_match.group(1)); pct = float(disc_match.group(1) or disc_match.group(2))
+        if 0 <= pct < 100:
+            original = sale / (1 - pct / 100)
+            results.append({
+                "type": "percentage_reverse",
+                "data": {"sale": sale, "percent": pct, "original": original},
+                "text": f"### Verified percentage calculation\nOriginal price = {sale:g} / (1 - {pct:g}/100) = **{_format_num(original, 2)}**"
+            })
+
+    return results
+
+
+def verified_context_text(results):
+    if not results:
+        return ""
+    chunks = [
+        "===== VERIFIED ACADEMIC CALCULATIONS =====",
+        "These results were computed by deterministic Python/statistics libraries. "
+        "Use them as authoritative numerical results. Do not change, round differently, or invent values. "
+        "If the problem requires a method not covered by the local verifier, use code execution and verify the result.",
+    ]
+    for r in results:
+        chunks.append(r["text"])
+    chunks.append("===== END VERIFIED ACADEMIC CALCULATIONS =====")
+    return "\n\n".join(chunks)
+
+
+def wants_search(text):
+    lower = text.lower()
+    return any(k in lower for k in (
+        "research", "latest", "current", "today", "this year", "recent", "news", "according to",
+        "source", "sources", "citation", "cite", "look up", "find online", "what does the website say"
+    ))
+
+
+def needs_code_execution(text, verified_results):
+    lower = text.lower()
+    numeric_words = (
+        "calculate", "solve", "probability", "statistics", "statistic", "regression", "correlation",
+        "standard deviation", "variance", "confidence interval", "hypothesis", "p-value", "p value",
+        "distribution", "normal", "binomial", "chi-square", "anova", "t-test", "t test", "excel",
+        "spreadsheet", "dataset", "data analysis", "equation", "integral", "derivative", "matrix",
+        "optimization", "quantitative", "percent", "percentage", "odds", "combin", "permutation"
+    )
+    return bool(verified_results) or any(k in lower for k in numeric_words)
+
+
+def extract_interaction_text(interaction):
+    text = getattr(interaction, "output_text", None)
+    if text:
+        return text
+    pieces = []
+    for step in getattr(interaction, "steps", []) or []:
+        if getattr(step, "type", "") == "model_output":
+            for block in getattr(step, "content", []) or []:
+                if getattr(block, "type", "") == "text" and getattr(block, "text", None):
+                    pieces.append(block.text)
+    return "\n\n".join(pieces).strip()
 
 
 def build_prompt(student_message):
@@ -483,71 +956,180 @@ def build_prompt(student_message):
 
 
 def call_tutor(student_message):
+    """Hybrid tutor: deterministic verification + Gemini Interactions tools.
+
+    Numerical/academic tasks are verified locally when possible. Complex or
+    unfamiliar calculations are delegated to Gemini with Python code execution,
+    and research questions can use Google Search grounding.
+    """
+    verified_results = local_academic_verification(student_message)
+    st.session_state.last_verified_academic = verified_results or None
+
+    # Render the deterministic regression graph whenever regression was verified.
+    reg = next((r["data"] for r in verified_results if r["type"] == "regression"), None)
+    if reg:
+        st.session_state.last_verified_result = reg
+        st.session_state.last_verified_plot = make_regression_plot(reg)
+    else:
+        st.session_state.last_verified_result = None
+        st.session_state.last_verified_plot = None
+
     client = get_client()
     if client is None:
+        if verified_results:
+            return verified_context_text(verified_results) + (
+                "\n\nGemini is not connected right now, so I am showing the verified calculation results."
+            )
         return (
-            "### API key needed\n\n"
-            "Add your Gemini API key as `GEMINI_API_KEY` in Streamlit Secrets. "
-            "The interface is ready; the key is required to generate tutor responses."
+            "### Gemini API key needed\n\n"
+            "Add `GEMINI_API_KEY` in Streamlit Secrets. The local academic verifier can still handle "
+            "several common math/statistics tasks, but Gemini is needed for complex/open-ended tutoring."
         )
 
-    # Keep normal tutoring fast. Gemini 3.5 Flash-Lite is designed for
-    # routine, high-throughput requests. We intentionally avoid a long
-    # sequential fallback chain because each extra model attempt can make a
-    # temporary 503 feel like the app is hanging. The Google SDK already has
-    # transient-error retry logic. The model can still be overridden in
-    # Streamlit Secrets with GEMINI_MODEL.
-    model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
-
-    contents = []
-
-    # Add recent conversation context.
+    # Build recent conversation context without relying on server-side state.
     recent = st.session_state.messages[-12:]
-    history_text = []
+    history_lines = []
     for msg in recent:
         role = "Student" if msg["role"] == "student" else "Tutor"
-        history_text.append(f"{role}: {msg['content']}")
-    if history_text:
-        contents.append("\nCONVERSATION CONTEXT:\n" + "\n".join(history_text))
+        history_lines.append(f"{role}: {msg['content']}")
 
-    contents.append(build_prompt(student_message))
+    prompt = build_prompt(student_message)
+    if history_lines:
+        prompt = "CONVERSATION CONTEXT:\n" + "\n".join(history_lines) + "\n\n" + prompt
 
-    # Add image files directly when possible.
-    if types is not None:
-        for f in st.session_state.uploaded_files:
-            if f.get("raw") is not None and f.get("mime", "").startswith("image/"):
-                try:
-                    contents.append(
-                        types.Part.from_bytes(
-                            data=f["raw"],
-                            mime_type=f["mime"],
-                        )
-                    )
-                except Exception:
-                    pass
+    if verified_results:
+        prompt += "\n\n" + verified_context_text(verified_results)
+
+    prompt += """
+
+ACADEMIC ACCURACY PROTOCOL
+- Numerical accuracy is critical because Student may submit this work for a grade.
+- For calculations, statistics, mathematics, quantitative reasoning, and data analysis,
+  do not rely on mental arithmetic or intuition when Python calculation can verify the result.
+- If the local verified results above exist, treat them as authoritative and explain those exact values.
+- If the local verifier does not cover the task, use the Python code execution tool to calculate/verify it.
+- For statistics, check definitions, assumptions, sample vs population formulas, degrees of freedom,
+  rounding, and the requested confidence/significance level.
+- For Excel tasks, preserve exact cell references and formulas when visible, and distinguish formula
+  results from interpretations.
+- Never invent data, formula results, p-values, regression coefficients, or spreadsheet values.
+- If information is missing, say exactly what is missing.
+
+TUTORING PROTOCOL
+- Give the final verified result clearly.
+- Then teach the method step by step.
+- If Student supplied work, identify what is correct before correcting errors.
+- Use simple language first, then technical detail as needed.
+- Do not fabricate a Student message or reaction.
+"""
+
+    input_blocks = [{"type": "text", "text": prompt}]
+    # Send original uploaded media/documents to Gemini when practical.
+    # Small files can be embedded directly; large files use the Files API so
+    # request payloads stay manageable and reusable for the model.
+    for f in st.session_state.uploaded_files:
+        raw = f.get("raw")
+        mime = f.get("mime", "application/octet-stream")
+        if not raw:
+            continue
+        try:
+            if mime.startswith("image/"):
+                input_blocks.append({
+                    "type": "image",
+                    "data": base64.b64encode(raw).decode("utf-8"),
+                    "mime_type": mime,
+                })
+            else:
+                if len(raw) <= 50 * 1024 * 1024:
+                    input_blocks.append({
+                        "type": "document",
+                        "data": base64.b64encode(raw).decode("utf-8"),
+                        "mime_type": mime,
+                    })
+                else:
+                    with tempfile.NamedTemporaryFile(delete=False, suffix="_" + f["name"]) as tmp:
+                        tmp.write(raw)
+                        tmp_path = tmp.name
+                    try:
+                        uploaded = client.files.upload(file=tmp_path)
+                        input_blocks.append({
+                            "type": "document",
+                            "uri": uploaded.uri,
+                            "mime_type": uploaded.mime_type,
+                        })
+                    finally:
+                        try:
+                            os.remove(tmp_path)
+                        except Exception:
+                            pass
+        except Exception:
+            # Extracted text remains in the prompt as a safe fallback.
+            pass
+
+    use_code = needs_code_execution(student_message, verified_results)
+    use_search = wants_search(student_message)
+    tools = []
+    if use_code:
+        tools.append({"type": "code_execution"})
+    if use_search:
+        tools.append({"type": "google_search"})
+
+    model_name = get_config_value("GEMINI_MODEL", "gemini-3.8-flash")
+    fallback_model = get_config_value("GEMINI_FALLBACK_MODEL", "gemini-3.7-flash")
+    thinking_level = "high" if use_code else "low"
+
+    def run_model(model):
+        kwargs = {
+            "model": model,
+            "input": input_blocks,
+        }
+        if tools:
+            kwargs["tools"] = tools
+        # Gemini 3.8 supports tunable thinking levels. If an older SDK rejects
+        # generation_config, the retry below omits it.
+        kwargs["generation_config"] = {"thinking_level": thinking_level}
+        try:
+            return client.interactions.create(**kwargs)
+        except TypeError:
+            kwargs.pop("generation_config", None)
+            return client.interactions.create(**kwargs)
 
     try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=contents,
-        )
-        text = response.text or "I couldn't generate a response for that question."
+        interaction = run_model(model_name)
+        st.session_state.last_interaction_id = getattr(interaction, "id", None)
+        text = extract_interaction_text(interaction)
+        if not text:
+            text = "I completed the tool step, but no final tutor response was returned. Please try again."
         return text
-    except Exception as e:
-        error_text = str(e).upper()
-        if "503" in error_text or "UNAVAILABLE" in error_text:
+    except Exception as first_error:
+        error_upper = str(first_error).upper()
+        if "503" in error_upper or "UNAVAILABLE" in error_upper:
+            # If we already have deterministic results, never hide them behind a model outage.
+            if verified_results:
+                return (
+                    verified_context_text(verified_results)
+                    + "\n\n**Gemini is temporarily unavailable.** The numerical results above were calculated locally, so you can still use them while the tutor explanation service is unavailable."
+                )
+            # One fast fallback attempt only. This avoids the long multi-model cycling
+            # behavior that previously made the app feel slow.
+            if fallback_model and fallback_model != model_name:
+                try:
+                    interaction = run_model(fallback_model)
+                    st.session_state.last_interaction_id = getattr(interaction, "id", None)
+                    text = extract_interaction_text(interaction)
+                    if text:
+                        return text
+                except Exception:
+                    pass
             return (
-                "Gemini is temporarily busy. Please try the message again in a few seconds. "
-                "I kept the tutor on a fast model so the app does not spend a long time "
-                "cycling through multiple models.\n\n"
-                f"**Technical detail:** `{e}`"
+                "Gemini is temporarily busy. Please try again in a few seconds. "
+                "For complex math/statistics, the app will use its local verification engine whenever the task contains enough explicit data."
             )
         return (
             "I ran into an error while generating the tutor response.\n\n"
-            f"**Technical detail:** `{e}`\n\n"
-            "Please check the API key, model name, and Streamlit logs."
+            f"**Technical detail:** `{first_error}`\n\n"
+            "The app's local verification layer remains available for supported numerical tasks."
         )
-
 
 def generate_visual(prompt, reference_images=None):
     """Generate a colorful educational visual with Gemini's image model."""
@@ -574,13 +1156,9 @@ def generate_visual(prompt, reference_images=None):
 
     try:
         interaction = client.interactions.create(
-            model=os.getenv("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image"),
+            model=get_config_value("GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image"),
             input=inputs,
-            response_format={
-                "type": "image",
-                "aspect_ratio": "16:9",
-                "image_size": os.getenv("GEMINI_IMAGE_SIZE", "1K"),
-            },
+            generation_config={"thinking_level": "minimal"},
         )
         output_image = getattr(interaction, "output_image", None)
         if output_image and getattr(output_image, "data", None):
@@ -602,6 +1180,10 @@ def start_new_chat():
     st.session_state.messages = []
     st.session_state.uploaded_files = []
     st.session_state.generated_visuals = []
+    st.session_state.last_verified_result = None
+    st.session_state.last_verified_plot = None
+    st.session_state.last_verified_academic = None
+    st.session_state.last_interaction_id = None
     st.session_state.new_chat_counter += 1
 
 
@@ -758,6 +1340,21 @@ with main_col:
             )
             st.markdown(msg["content"])
 
+    if st.session_state.last_verified_plot:
+        st.markdown("### 📈 Verified statistics graph")
+        st.image(
+            st.session_state.last_verified_plot,
+            caption="Programmatically calculated scatter plot and least-squares regression line",
+            use_container_width=True,
+        )
+        st.download_button(
+            "⬇️ Save regression graph",
+            data=st.session_state.last_verified_plot,
+            file_name="verified_regression_graph.png",
+            mime="image/png",
+            key="download_verified_regression_graph",
+        )
+
     if st.session_state.generated_visuals:
         st.markdown("### 🎨 Generated teaching visuals")
         for idx, visual in enumerate(st.session_state.generated_visuals):
@@ -793,7 +1390,7 @@ with main_col:
     uploads = st.file_uploader(
         "📎 Choose files",
         type=[
-            "pdf", "docx", "xlsx", "xlsm", "csv", "txt", "md",
+            "pdf", "docx", "xlsx", "xls", "xlsm", "csv", "txt", "md",
             "png", "jpg", "jpeg", "webp", "gif", "pptx", "json", "xml"
         ],
         accept_multiple_files=True,
@@ -815,7 +1412,9 @@ with main_col:
                     "name": uploaded.name,
                     "size": uploaded.size,
                     "text": text,
-                    "raw": raw_bytes if uploaded.type.startswith("image/") else None,
+                    # Keep the bytes so the Gemini Interactions API can inspect the
+                    # original document/image instead of relying only on extracted text.
+                    "raw": raw_bytes,
                     "mime": mime_type_for(uploaded.name),
                 })
                 added += 1
