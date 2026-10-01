@@ -473,7 +473,18 @@ def call_tutor(student_message):
             "The interface is ready; the key is required to generate tutor responses."
         )
 
-    model_name = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    # Use a small fallback chain so temporary model-capacity spikes do not
+    # break the whole tutor. The first model can be overridden in Secrets
+    # with GEMINI_MODEL.
+    primary_model = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+    fallback_models = [
+        primary_model,
+        "gemini-3.7-flash",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+    ]
+    # Remove duplicates while preserving order.
+    model_candidates = list(dict.fromkeys(fallback_models))
 
     contents = []
 
@@ -502,18 +513,34 @@ def call_tutor(student_message):
                 except Exception:
                     pass
 
-    try:
-        response = client.models.generate_content(
-            model=model_name,
-            contents=contents,
-        )
-        return response.text or "I couldn't generate a response for that question."
-    except Exception as e:
-        return (
-            "I ran into an error while generating the tutor response.\n\n"
-            f"**Technical detail:** `{e}`\n\n"
-            "Please check the API key, model name, and Streamlit logs."
-        )
+    last_error = None
+    for model_name in model_candidates:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=contents,
+            )
+            text = response.text or "I couldn't generate a response for that question."
+            return text
+        except Exception as e:
+            last_error = e
+            error_text = str(e).upper()
+            # Temporary capacity errors are safe to retry on another current
+            # Flash model. Other errors are returned immediately because they
+            # usually indicate a key, request, or code problem.
+            if "503" not in error_text and "UNAVAILABLE" not in error_text:
+                return (
+                    "I ran into an error while generating the tutor response.\n\n"
+                    f"**Technical detail:** `{e}`\n\n"
+                    "Please check the API key, model name, and Streamlit logs."
+                )
+
+    return (
+        "The Gemini Flash models are temporarily busy right now. I tried the "
+        "available fallback models automatically, but they all returned a temporary "
+        "503/unavailable response. Please try sending the question again in a moment."
+        f"\n\n**Last technical detail:** `{last_error}`"
+    )
 
 
 def generate_visual(prompt, reference_images=None):
