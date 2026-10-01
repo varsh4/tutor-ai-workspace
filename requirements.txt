@@ -2,6 +2,13 @@ streamlit
 google-genai
 pypdf
 python-docx
+python-pptx
 openpyxl
+xlrd
 pandas
+numpy
+scipy
+sympy
+scikit-learn
 Pillow
+matplotlib
