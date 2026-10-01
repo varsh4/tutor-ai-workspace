@@ -727,6 +727,158 @@ def _format_num(v, digits=6):
     return f"{float(v):.{digits}f}".rstrip("0").rstrip(".")
 
 
+
+def _extract_stat_parameter(text, labels):
+    """Extract a named numeric parameter such as mean/mu or sd/sigma."""
+    label_pattern = "|".join(re.escape(x) for x in labels)
+    m = re.search(rf"(?:{label_pattern})\s*(?:=|:|is|of)?\s*(-?\d+(?:\.\d+)?)", text, re.I)
+    return float(m.group(1)) if m else None
+
+
+def verified_normal_distribution(text):
+    """Deterministic normal-distribution engine for common textbook questions."""
+    if scipy_stats is None or np is None:
+        return None
+    lower = text.lower()
+    normal_terms = ("normal distribution", "normally distributed", "normal curve", "z score", "z-score", "standard normal")
+    if not any(term in lower for term in normal_terms):
+        return None
+
+    mu = _extract_stat_parameter(text, ["mean", "mu", "μ"])
+    sd = _extract_stat_parameter(text, ["standard deviation", "std", "sd", "sigma", "σ"])
+    if mu is None or sd is None or sd <= 0:
+        return None
+
+    # Explicit x/value/score for z-score.
+    x = _extract_stat_parameter(text, ["x", "value", "score", "height", "weight", "income"])
+    if x is not None and any(k in lower for k in ("z score", "z-score", "standard score")):
+        z = (x - mu) / sd
+        return {
+            "type": "z_score",
+            "data": {"x": x, "mu": mu, "sd": sd, "z": z},
+            "text": (
+                "### Verified z-score\n"
+                f"z = (x − μ) / σ = ({_format_num(x)} − {_format_num(mu)}) / {_format_num(sd)} = **{_format_num(z, 6)}**"
+            ),
+        }
+
+    # Detect probability/area requests. We intentionally require probability
+    # language so a normal-distribution word problem is not misread as an x-value.
+    if not any(k in lower for k in ("probability", "prob", "area", "percent", "percentage", "what proportion", "what fraction")):
+        return None
+
+    # Two boundary values: between / from-to / within.
+    nums = [float(v) for v in re.findall(r"-?\d+(?:\.\d+)?", text)]
+    # Remove the mean and SD from candidate boundaries when possible.
+    candidates = []
+    for v in nums:
+        if abs(v - mu) > 1e-12 and abs(v - sd) > 1e-12:
+            candidates.append(v)
+
+    between = re.search(
+        r"(?:between|from)\s+(-?\d+(?:\.\d+)?)\s+(?:and|to)\s+(-?\d+(?:\.\d+)?)",
+        lower,
+    )
+    if between:
+        a, b = float(between.group(1)), float(between.group(2))
+        if a > b:
+            a, b = b, a
+        probability = float(scipy_stats.norm.cdf(b, loc=mu, scale=sd) - scipy_stats.norm.cdf(a, loc=mu, scale=sd))
+        za, zb = (a - mu) / sd, (b - mu) / sd
+        return {
+            "type": "normal_probability",
+            "data": {"mu": mu, "sd": sd, "a": a, "b": b, "za": za, "zb": zb, "probability": probability, "kind": "between"},
+            "text": (
+                "### Verified normal-distribution probability\n"
+                f"P({_format_num(a)} < X < {_format_num(b)}) = **{probability:.6f}** = **{probability*100:.2f}%**\n\n"
+                f"z₁ = {_format_num(za, 4)}, z₂ = {_format_num(zb, 4)}"
+            ),
+        }
+
+    # Single cutoff. Prefer wording to decide left/right tail.
+    cutoff_match = re.search(
+        r"(?:less than|below|under|at most|no more than|lower than|greater than|above|over|at least|no less than|higher than)\s+(-?\d+(?:\.\d+)?)",
+        lower,
+    )
+    if not cutoff_match and candidates:
+        # Only use this fallback for phrases that explicitly contain a probability question.
+        cutoff_match = re.search(r"(?:x|value|score)\s*(?:=|of|is)?\s*(-?\d+(?:\.\d+)?)", lower)
+    if cutoff_match:
+        cutoff = float(cutoff_match.group(1))
+        z = (cutoff - mu) / sd
+        if re.search(r"(?:greater than|above|over|at least|no less than|higher than)", lower):
+            probability = float(scipy_stats.norm.sf(cutoff, loc=mu, scale=sd))
+            symbol = ">"
+        else:
+            probability = float(scipy_stats.norm.cdf(cutoff, loc=mu, scale=sd))
+            symbol = "<"
+        return {
+            "type": "normal_probability",
+            "data": {"mu": mu, "sd": sd, "x": cutoff, "z": z, "probability": probability, "kind": "tail", "symbol": symbol},
+            "text": (
+                "### Verified normal-distribution probability\n"
+                f"z = ({_format_num(cutoff)} − {_format_num(mu)}) / {_format_num(sd)} = **{_format_num(z, 4)}**\n\n"
+                f"P(X {symbol} {_format_num(cutoff)}) = **{probability:.6f}** = **{probability*100:.2f}%**"
+            ),
+        }
+
+    return None
+
+
+def fast_tutor_response(results):
+    """Turn deterministic results into a student-facing answer without Gemini."""
+    if not results:
+        return None
+
+    # For a single simple result, give a teaching-oriented explanation.
+    if len(results) == 1:
+        r = results[0]
+        d = r.get("data", {})
+        if r["type"] == "z_score":
+            return (
+                "### Let's solve it step by step\n\n"
+                "We use the z-score formula:\n\n"
+                "**z = (x − μ) / σ**\n\n"
+                f"Given:\n- x = {d['x']:g}\n- μ = {d['mu']:g}\n- σ = {d['sd']:g}\n\n"
+                f"Substitute:\n**z = ({d['x']:g} − {d['mu']:g}) / {d['sd']:g}**\n\n"
+                f"**z = {d['z']:.4f}**\n\n"
+                "So the observation is **{:.2f} standard deviations above the mean**.".format(d['z'])
+            )
+        if r["type"] == "normal_probability":
+            if d.get("kind") == "between":
+                return (
+                    "### Let's solve it step by step\n\n"
+                    f"Mean μ = **{d['mu']:g}**, standard deviation σ = **{d['sd']:g}**.\n\n"
+                    "First convert both boundaries to z-scores:\n\n"
+                    f"z₁ = ({d['a']:g} − {d['mu']:g}) / {d['sd']:g} = **{d['za']:.4f}**\n\n"
+                    f"z₂ = ({d['b']:g} − {d['mu']:g}) / {d['sd']:g} = **{d['zb']:.4f}**\n\n"
+                    "Then find the area between the two z-scores:\n\n"
+                    f"**P({d['a']:g} < X < {d['b']:g}) = {d['probability']:.6f}**\n\n"
+                    f"That is **{d['probability']*100:.2f}%**."
+                )
+            return (
+                "### Let's solve it step by step\n\n"
+                f"Mean μ = **{d['mu']:g}**, standard deviation σ = **{d['sd']:g}**.\n\n"
+                f"First find the z-score:\n**z = ({d['x']:g} − {d['mu']:g}) / {d['sd']:g} = {d['z']:.4f}**\n\n"
+                f"Using the normal distribution, **P(X {d['symbol']} {d['x']:g}) = {d['probability']:.6f} = {d['probability']*100:.2f}%**."
+            )
+        if r["type"] == "percentage_reverse":
+            return r["text"] + "\n\nThe key idea is that a discount of p% leaves (100 − p)% of the original price."
+        if r["type"] == "equation":
+            return r["text"] + "\n\nThe equation was solved symbolically, so the answer is not based on approximate mental arithmetic."
+        if r["type"] == "combinatorics":
+            return r["text"] + "\n\nUse combinations when order does not matter; use permutations when order matters."
+        if r["type"] == "descriptive":
+            return r["text"]
+        if r["type"] == "correlation":
+            return r["text"]
+        if r["type"] == "one_sample_t":
+            return r["text"]
+        if r["type"] == "regression":
+            return regression_answer_text(d)
+
+    return verified_context_text(results)
+
 def local_academic_verification(student_message):
     """Run deterministic academic checks before asking the LLM to explain.
 
@@ -739,6 +891,11 @@ def local_academic_verification(student_message):
     text = student_message.strip()
     lower = text.lower()
     results = []
+
+    # 0) Common normal-distribution questions: solve locally for speed and accuracy.
+    normal = verified_normal_distribution(text)
+    if normal:
+        results.append(normal)
 
     # 1) Regression/correlation from explicit coordinate pairs or table rows.
     reg = verified_regression(text)
@@ -973,6 +1130,11 @@ def call_tutor(student_message):
     else:
         st.session_state.last_verified_result = None
         st.session_state.last_verified_plot = None
+
+    # FAST PATH: deterministic textbook calculations do not need a Gemini round-trip.
+    # This is the main latency optimization for common math/statistics questions.
+    if verified_results and not st.session_state.uploaded_files:
+        return fast_tutor_response(verified_results)
 
     client = get_client()
     if client is None:
